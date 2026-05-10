@@ -9,14 +9,11 @@
         #canvasContainer { position: relative; width: 300px; height: 300px; background: #000; border: 2px solid #333; overflow: hidden; border-radius: 0; box-shadow: 0 4px 10px rgba(0,0,0,0.2); margin-bottom: 15px; }
         canvas { width: 300px; height: 300px; display: block; cursor: crosshair; }
         
-        /* Nova linha de botões de modo */
         .mode-selector { display: flex; gap: 5px; width: 300px; margin-bottom: 15px; }
         .mode-selector button { flex: 1; padding: 10px 5px; font-size: 12px; background: #555; }
         .mode-selector button.active-mode { background: #007bff; }
 
         .controls { display: flex; flex-direction: column; gap: 10px; width: 300px; transition: transform 0.3s ease; }
-        
-        /* Container para ocultar configs */
         #collapsibleSettings { display: flex; flex-direction: column; gap: 10px; overflow: hidden; transition: all 0.3s ease; }
         .settings-hidden { transform: translateX(120%); position: absolute; }
 
@@ -126,19 +123,14 @@
         let touchStartX = 0, touchStartY = 0;
         let countdownInterval = null;
 
-        // Estados de Modo
-        let currentAppMode = 'camera'; // camera, draw, stream, upload
+        let currentAppMode = 'camera'; 
         let isDrawing = false;
+        let overlayImage = null; // Armazena a imagem de upload para sobreposição
         
-        // Estado Stream e Zoom
-        let streamInterval = null;
-        let streamRoom = "";
+        // --- ESTADO STREAM (VOZ PARA TEXTO) ---
+        let recognition = null;
         let isStreamPaused = false;
-        let streamZoom = 1;
-        let streamOffsetX = 0;
-        let streamOffsetY = 0;
-        let initialPinchDist = 0;
-        let lastTouchX = 0, lastTouchY = 0;
+        const LINE_HEIGHT = 40; 
 
         setupLoggerUI(document.getElementById('logContent'), document.getElementById('progressBar'));
 
@@ -153,29 +145,30 @@
         document.getElementById('ditherMode').addEventListener('change', updateProcessorSettings);
         document.getElementById('rotation').addEventListener('change', updateProcessorSettings);
 
-        // --- GESTÃO DE MODOS ---
         function setMode(mode) {
-            stopCamera();
-            clearInterval(streamInterval);
+            // Se mudarmos para câmera, não paramos a câmera se ela já estiver rodando
+            if (mode !== 'camera') {
+                stopCamera();
+                overlayImage = null; 
+            }
+            if (recognition) recognition.stop();
             currentAppMode = mode;
-            ctx.setTransform(1, 0, 0, 1, 0, 0); // Reset transform
+            ctx.setTransform(1, 0, 0, 1, 0, 0); 
             
             document.querySelectorAll('.mode-selector button').forEach(b => b.classList.remove('active-mode'));
             
             if (mode === 'camera') {
                 document.getElementById('btnModeCam').classList.add('active-mode');
-                logger.info("Modo Câmera Ativo (Aguardando Play)");
+                if(!isCameraRunning) startCamera();
             } else if (mode === 'draw') {
                 document.getElementById('btnModeDraw').classList.add('active-mode');
                 clearCanvas();
-                logger.info("Modo Desenho Ativo");
             } else if (mode === 'stream') {
                 document.getElementById('btnModeStream').classList.add('active-mode');
-                initStream();
+                initVoiceStream();
             }
         }
 
-        // --- CÂMERA ---
         async function startCamera() {
             try {
                 if (stream) stream.getTracks().forEach(t => t.stop());
@@ -199,129 +192,170 @@
         }
 
         function drawFrame() {
-            if (!isCameraRunning || currentAppMode !== 'camera') return;
+            if (!isCameraRunning || (currentAppMode !== 'camera' && currentAppMode !== 'upload')) return;
+            
             ctx.save();
+            // 1. Desenha o vídeo (Fundo)
             if (isMirrored) { ctx.translate(canvas.width, 0); ctx.scale(-1, 1); }
             ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
             ctx.restore();
+
+            // 2. Desenha a sobreposição (Se houver imagem carregada)
+            if (overlayImage) {
+                const scale = Math.max(canvas.width / overlayImage.width, canvas.height / overlayImage.height);
+                const x = (canvas.width / 2) - (overlayImage.width / 2) * scale;
+                const y = (canvas.height / 2) - (overlayImage.height / 2) * scale;
+                ctx.drawImage(overlayImage, x, y, overlayImage.width * scale, overlayImage.height * scale);
+            }
+
             animationId = requestAnimationFrame(drawFrame);
         }
 
-        // --- STREAM ---
-        function initStream() {
-            const name = prompt("Nome da sala de Stream:");
-            if (name) {
-                streamRoom = name;
-                isStreamPaused = false;
-                streamZoom = 1; streamOffsetX = 0; streamOffsetY = 0;
-                startStreamInterval();
+        // --- LÓGICA DE STREAM (VOICE TO PRINT) ---
+        async function initVoiceStream() {
+            clearCanvas();
+            try {
+                const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+                if (!SpeechRecognition) return alert("Navegador incompatível.");
+
+                recognition = new SpeechRecognition();
+                recognition.lang = 'pt-BR';
+                recognition.continuous = true;
+                recognition.interimResults = true; 
+
+                recognition.onresult = async (event) => {
+                    if (isStreamPaused) return;
+                    let result = event.results[event.results.length - 1];
+                    let text = result[0].transcript.trim();
+
+                    if (result.isFinal) {
+                        await processTextLine(text);
+                    } else {
+                        renderTextToCanvas(text); 
+                    }
+                };
+
+                recognition.onend = () => { if(currentAppMode === 'stream') recognition.start(); };
+                recognition.start();
+                logger.info("Microfone aberto. Diga algo ou 'Pronto'.");
+
+            } catch (err) { logger.error("Erro no Microfone", err); }
+        }
+
+        async function processTextLine(text) {
+            const isFinished = text.toLowerCase().includes("pronto");
+            const cleanText = text.replace(/pronto/gi, "").trim();
+
+            if (cleanText.length > 0) {
+                renderTextToCanvas(cleanText);
+
+                imageProcessor.updateSettings({ 
+                    padding: 0, 
+                    autoscale: false, 
+                    threshold: parseInt(document.getElementById('threshold').value) 
+                });
+
+                const sliceCanvas = document.createElement('canvas');
+                sliceCanvas.width = 384; 
+                sliceCanvas.height = 30; 
+                const sCtx = sliceCanvas.getContext('2d');
+                sCtx.fillStyle = "white";
+                sCtx.fillRect(0, 0, 384, 30);
+                sCtx.fillStyle = "black";
+                sCtx.font = "bold 24px sans-serif";
+                sCtx.textAlign = "center";
+                sCtx.fillText(cleanText, 192, 24);
+
+                if (isPrinterConnected()) {
+                    await imageProcessor.loadImage(sliceCanvas.toDataURL());
+                    const processed = imageProcessor.processImage();
+                    await printImage(processed);
+                }
+
+                setTimeout(() => {
+                    const imgData = ctx.getImageData(0, LINE_HEIGHT, canvas.width, canvas.height - LINE_HEIGHT);
+                    clearCanvas();
+                    ctx.putImageData(imgData, 0, 0);
+                }, 500);
+            }
+
+            if (isFinished) {
+                recognition.stop();
+                setMode('camera');
             }
         }
 
-        function startStreamInterval() {
-            clearInterval(streamInterval);
-            streamInterval = setInterval(loadStreamImage, 3000);
-            loadStreamImage();
+        function renderTextToCanvas(text) {
+            ctx.fillStyle = "white";
+            ctx.fillRect(0, 0, canvas.width, canvas.height); 
+            ctx.fillStyle = "black";
+            ctx.font = "bold 20px sans-serif";
+            ctx.textAlign = "center";
+            ctx.fillText(text, canvas.width/2, canvas.height/2);
         }
 
-        function loadStreamImage() {
-            if (isStreamPaused || currentAppMode !== 'stream') return;
-            const rand = Math.floor(Math.random() * 999999);
-            const img = new Image();
-            img.crossOrigin = "anonymous";
-            img.onload = () => {
-                ctx.clearRect(0, 0, canvas.width, canvas.height);
-                ctx.save();
-                ctx.translate(canvas.width/2 + streamOffsetX, canvas.height/2 + streamOffsetY);
-                ctx.scale(streamZoom, streamZoom);
-                ctx.drawImage(img, -canvas.width/2, -canvas.height/2, canvas.width, canvas.height);
-                ctx.restore();
-            };
-            img.src = `https://jpeg.live.mmcdn.com/stream?room=${streamRoom}&f=${rand}`;
-        }
-
-        // --- DESENHO ---
         function clearCanvas() {
             ctx.fillStyle = "white";
             ctx.fillRect(0, 0, canvas.width, canvas.height);
+            overlayImage = null;
         }
 
-        // --- INPUTS E ARRASTAR ---
+        // --- GESTOS E CONFIGURAÇÕES ---
         let dragStartX = 0;
         settingsDiv.addEventListener('touchstart', (e) => dragStartX = e.touches[0].clientX);
         settingsDiv.addEventListener('touchend', (e) => {
-            if (e.changedTouches[0].clientX - dragStartX > 80) {
-                settingsDiv.classList.add('settings-hidden');
-                logger.info("Configurações ocultas (Arraste para esquerda para voltar)");
-            }
+            if (e.changedTouches[0].clientX - dragStartX > 80) settingsDiv.classList.add('settings-hidden');
         });
         document.body.addEventListener('touchstart', (e) => dragStartX = e.touches[0].clientX);
         document.body.addEventListener('touchend', (e) => {
-            if (dragStartX - e.changedTouches[0].clientX > 80 && settingsDiv.classList.contains('settings-hidden')) {
-                settingsDiv.classList.remove('settings-hidden');
-            }
+            if (dragStartX - e.changedTouches[0].clientX > 80) settingsDiv.classList.remove('settings-hidden');
         });
 
-        // --- EVENTOS DE TOQUE (CANVAS) ---
         canvas.addEventListener('touchstart', (e) => {
             const t = e.touches;
             touchStartX = t[0].clientX; touchStartY = t[0].clientY;
-            lastTouchX = touchStartX; lastTouchY = touchStartY;
+            
+            const now = Date.now();
+            const TIMESPAN = 300;
+            if (now - lastTap < TIMESPAN) {
+                facingMode = facingMode === 'user' ? 'environment' : 'user';
+                if(isCameraRunning) startCamera();
+                logger.info("Câmera trocada");
+            } else {
+                if (!isCameraRunning && currentAppMode === 'camera') startCamera();
+            }
+            lastTap = now;
 
             if (currentAppMode === 'draw') {
                 isDrawing = true;
                 const rect = canvas.getBoundingClientRect();
                 ctx.beginPath(); ctx.moveTo(t[0].clientX - rect.left, t[0].clientY - rect.top);
-            } else if (currentAppMode === 'stream' && t.length === 2) {
-                initialPinchDist = Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
             }
         });
 
         canvas.addEventListener('touchmove', (e) => {
-            const t = e.touches;
-            const rect = canvas.getBoundingClientRect();
-
             if (currentAppMode === 'draw' && isDrawing) {
+                const rect = canvas.getBoundingClientRect();
                 ctx.lineWidth = 5; ctx.lineCap = 'round'; ctx.strokeStyle = 'black';
-                ctx.lineTo(t[0].clientX - rect.left, t[0].clientY - rect.top); ctx.stroke();
-                e.preventDefault();
-            } else if (currentAppMode === 'stream') {
-                if (t.length === 2) {
-                    const dist = Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
-                    streamZoom *= (dist / initialPinchDist);
-                    initialPinchDist = dist;
-                } else {
-                    streamOffsetX += (t[0].clientX - lastTouchX);
-                    streamOffsetY += (t[0].clientY - lastTouchY);
-                }
-                lastTouchX = t[0].clientX; lastTouchY = t[0].clientY;
-                loadStreamImage();
+                ctx.lineTo(e.touches[0].clientX - rect.left, e.touches[0].clientY - rect.top); ctx.stroke();
                 e.preventDefault();
             }
         });
 
         canvas.addEventListener('touchend', (e) => {
             isDrawing = false;
-            if (currentAppMode !== 'camera') return;
-            
-            const touch = e.changedTouches[0];
-            const dx = touch.clientX - touchStartX;
-            if (Math.abs(dx) > 60) {
+            const touchEndX = e.changedTouches[0].clientX;
+            const diffX = touchEndX - touchStartX;
+            if (Math.abs(diffX) > 50) {
                 isMirrored = !isMirrored;
-            } else {
-                const now = Date.now();
-                if (!isCameraRunning) { if (now - lastTap > 300) startCamera(); }
-                else if (now - lastTap < 300) {
-                    facingMode = (facingMode === 'user' ? 'environment' : 'user');
-                    isMirrored = (facingMode === 'user');
-                    startCamera();
-                }
-                lastTap = now;
+                logger.info(isMirrored ? "Espelhamento Ativo" : "Espelhamento Inativo");
             }
         });
 
-        // --- BOTÕES DE CONTROLE ---
-        document.getElementById('btnModeCam').onclick = () => setMode('camera');
+        document.getElementById('btnModeCam').onclick = () => {
+            overlayImage = null;
+            setMode('camera');
+        };
         document.getElementById('btnModeUpload').onclick = () => fileInput.click();
         document.getElementById('btnModeDraw').onclick = () => setMode('draw');
         document.getElementById('btnModeStream').onclick = () => setMode('stream');
@@ -329,11 +363,27 @@
         fileInput.onchange = (e) => {
             const file = e.target.files[0];
             if (!file) return;
-            setMode('upload');
+            
             const reader = new FileReader();
             reader.onload = (ev) => {
                 const img = new Image();
-                img.onload = () => ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                img.onload = () => {
+                    overlayImage = img; // Salva para desenhar no frame da câmera
+                    
+                    if (!isCameraRunning) {
+                        setMode('upload');
+                        clearCanvas();
+                        const scale = Math.max(canvas.width / img.width, canvas.height / img.height);
+                        const x = (canvas.width / 2) - (img.width / 2) * scale;
+                        const y = (canvas.height / 2) - (img.height / 2) * scale;
+                        ctx.drawImage(img, x, y, img.width * scale, img.height * scale);
+                    } else {
+                        currentAppMode = 'camera';
+                        document.querySelectorAll('.mode-selector button').forEach(b => b.classList.remove('active-mode'));
+                        document.getElementById('btnModeCam').classList.add('active-mode');
+                        logger.info("Overlay carregado sobre a câmera.");
+                    }
+                };
                 img.src = ev.target.result;
             };
             reader.readAsDataURL(file);
@@ -342,31 +392,20 @@
         document.getElementById('btnToggleCamera').onclick = () => {
             if (currentAppMode === 'stream') {
                 isStreamPaused = !isStreamPaused;
-                logger.info(isStreamPaused ? "Stream Pausada" : "Stream Rodando");
                 return;
             }
-            if (isCameraRunning || currentAppMode === 'draw') {
-                executeTimedPause();
-            } else {
-                startCamera();
-            }
+            if (isCameraRunning || currentAppMode === 'draw') executeTimedPause();
+            else startCamera();
         };
 
         function executeTimedPause(callback) {
             const delay = parseInt(document.getElementById('timerSelect').value);
-            if (delay === 0 || (!isCameraRunning && currentAppMode !== 'draw')) {
-                if(currentAppMode === 'draw') clearCanvas();
-                stopCamera(); if (callback) callback(); return;
-            }
+            if (delay === 0) { stopCamera(); if(currentAppMode === 'draw') clearCanvas(); if(callback) callback(); return; }
             let tl = delay;
             countdownInterval = setInterval(() => {
                 tl -= 100;
                 timerDisplay.textContent = (tl/1000).toFixed(1) + "s";
-                if (tl <= 0) { 
-                    clearInterval(countdownInterval); 
-                    if(currentAppMode === 'draw') clearCanvas();
-                    stopCamera(); if(callback) callback(); 
-                }
+                if (tl <= 0) { clearInterval(countdownInterval); stopCamera(); if(currentAppMode === 'draw') clearCanvas(); if(callback) callback(); }
             }, 100);
         }
 
